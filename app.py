@@ -2,7 +2,6 @@ from flask import Flask, render_template, request, redirect, url_for, session, f
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, secrets, hmac, getpass
 from functools import wraps
-from urllib.parse import urlsplit
 
 app = Flask(__name__)
 # This classroom prototype is not approved for public deployment.
@@ -71,9 +70,6 @@ def init_db():
             meeting_id INTEGER NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE,
             status TEXT NOT NULL DEFAULT 'pending'
         )""")
-
-        if "meeting_url" not in {r["name"] for r in c.execute("PRAGMA table_info(video_requests)")}:
-            c.execute("ALTER TABLE video_requests ADD COLUMN meeting_url TEXT DEFAULT NULL")
 
         c.execute("""CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE, sender_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
@@ -184,14 +180,27 @@ def dashboard():
               "meetings": c.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]}
             return render_template("dashboard.html", user=user, stats=stats)
         if user["role"] == "student":
-            items=c.execute("""SELECT r.*,u.name AS other_name,u.department
+            items=c.execute("""SELECT r.*,u.name AS other_name,u.department,u.year,u.skills
                 FROM requests r JOIN users u ON u.id=r.mentor_id
                 WHERE r.student_id=? ORDER BY r.created_at DESC""",(user["id"],)).fetchall()
         else:
-            items=c.execute("""SELECT r.*,u.name AS other_name,u.department
+            items=c.execute("""SELECT r.*,u.name AS other_name,u.department,u.year,u.skills
                 FROM requests r JOIN users u ON u.id=r.student_id
                 WHERE r.mentor_id=? ORDER BY r.created_at DESC""",(user["id"],)).fetchall()
-    return render_template("dashboard.html",user=user,items=items)
+        uid = user["id"]
+        meeting_rows = c.execute("""SELECT m.*, CASE WHEN r.student_id=? THEN me.name ELSE st.name END AS other_name
+            FROM meetings m JOIN requests r ON r.id=m.request_id
+            JOIN users st ON st.id=r.student_id JOIN users me ON me.id=r.mentor_id
+            WHERE (r.student_id=? OR r.mentor_id=?) AND r.status='accepted'
+            ORDER BY m.meeting_date DESC""", (uid,uid,uid)).fetchall()
+        rating = c.execute("""SELECT AVG(f.rating) FROM feedback f JOIN requests r ON r.id=f.request_id
+            WHERE (r.student_id=? OR r.mentor_id=?) AND f.from_user<>? AND r.status='accepted'""",(uid,uid,uid)).fetchone()[0]
+        sent_feedback = c.execute("SELECT COUNT(*) FROM feedback WHERE from_user=?",(uid,)).fetchone()[0]
+    active = sum(r['status']=='accepted' for r in items)
+    pending = sum(r['status']=='pending' for r in items)
+    milestones = [('Profile completed', bool(user['department'] and user['interests'])), ('Connection accepted', bool(active)), ('Meeting recorded', bool(meeting_rows)), ('Feedback submitted', bool(sent_feedback))]
+    progress = 25 * sum(done for _,done in milestones)
+    return render_template("dashboard.html",user=user,items=items,meeting_rows=meeting_rows,active=active,pending=pending,rating=rating,milestones=milestones,progress=progress)
 
 @app.route("/profile", methods=["GET","POST"])
 @login_required
@@ -284,7 +293,7 @@ def meetings():
                 flash("Meeting log saved.", "success")
             else:
                 flash("Choose an accepted mentorship connection.", "danger")
-        rows=c.execute("""SELECT m.*,s.name AS student_name,me.name AS mentor_name, (SELECT status FROM video_requests WHERE meeting_id=m.id) AS video_status, (SELECT meeting_url FROM video_requests WHERE meeting_id=m.id AND status='approved' AND r.status='accepted' AND me.verified=1) AS meeting_url
+        rows=c.execute("""SELECT m.*,s.name AS student_name,me.name AS mentor_name, (SELECT status FROM video_requests WHERE meeting_id=m.id) AS video_status
             FROM meetings m JOIN requests r ON r.id=m.request_id
             JOIN users s ON s.id=r.student_id JOIN users me ON me.id=r.mentor_id
             WHERE r.student_id=? OR r.mentor_id=? ORDER BY m.meeting_date DESC""",
@@ -378,28 +387,6 @@ def review_video(request_id):
     flash("Review saved." if changed else "Request already reviewed or not found.", "success" if changed else "warning")
     return redirect(url_for("admin"))
 
-
-@app.route("/admin/meeting-link/<int:request_id>", methods=["POST"])
-@login_required
-@role_required("admin")
-def meeting_link(request_id):
-    token = session.get("review_token", "")
-    if not token or not hmac.compare_digest(token, request.form.get("review_token", "")):
-        return "Invalid review token", 400
-    link = request.form.get("meeting_url", "").strip()
-    try:
-        u = urlsplit(link)
-        valid = (u.scheme == "https" and u.netloc in ("meet.google.com", "teams.microsoft.com") and len(u.path) > 1 and len(link) <= 2048 and not any(ch.isspace() for ch in link))
-    except ValueError:
-        valid = False
-    if not valid or request.form.get("supervised") != "yes":
-        flash("Use an institution-managed HTTPS meeting link and confirm faculty supervision.", "danger")
-        return redirect(url_for("admin"))
-    with db() as c:
-        result = c.execute("UPDATE video_requests SET meeting_url=? WHERE id=? AND status='approved'", (link, request_id))
-        changed = result.rowcount
-    flash("Meeting link saved." if changed else "Approve the request first.", "success" if changed else "warning")
-    return redirect(url_for("admin"))
 
 @app.route("/admin/delete-user/<int:user_id>", methods=["POST"])
 @login_required
